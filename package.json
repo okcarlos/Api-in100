@@ -1,0 +1,15 @@
+{
+  "name": "beta1-formatador-planilha-in100",
+  "version": "1.1.0",
+  "description": "Beta 1 - formatador de CPF/benefício e consulta IN100",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.12.2",
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "xlsx": "^0.18.5"
+  }
+}
