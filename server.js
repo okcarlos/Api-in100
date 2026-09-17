@@ -322,3 +322,6 @@ app.listen(PORT, () => {
     console.log("✅ API_KEY configurada.");
   }
 });
+
+const cors = require("cors");
+app.use(cors());
