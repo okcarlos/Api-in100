@@ -3,7 +3,8 @@ const multer = require("multer");
 const XLSX = require("xlsx");
 const axios = require("axios");
 const path = require("path");
-
+const cors = require("cors");
+app.use(cors());
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -323,5 +324,3 @@ app.listen(PORT, () => {
   }
 });
 
-const cors = require("cors");
-app.use(cors());
