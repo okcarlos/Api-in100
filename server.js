@@ -17,8 +17,7 @@ const API_URL =
 // Por segurança, a API Key deve ser configurada como variável de ambiente.
 // PowerShell:
 //   $env:API_KEY="SUA_CHAVE_AQUI"
-// const API_KEY = process.env.API_KEY || "";
-const API_KEY = "XNgTlkeYbqjEf4A07bqMoqp5FaFiGEmu8WDgeIF4Oa10rLQKP6u18Y/mio552RH/";
+const API_KEY = process.env.API_KEY || "";
 
 // Intervalo entre consultas.
 const INTERVALO = 1000;
