@@ -4,8 +4,11 @@ const XLSX = require("xlsx");
 const axios = require("axios");
 const path = require("path");
 const cors = require("cors");
+const crypto = require("crypto");
+
 const app = express();
 const PORT = process.env.PORT || 3000;
+
 app.use(cors());
 
 // ============================================================
@@ -15,12 +18,9 @@ app.use(cors());
 const API_URL =
   "https://integration.ajin.io/v3/query-inss-balances/finder/await";
 
-// Por segurança, a API Key deve ser configurada como variável de ambiente.
-// PowerShell:
-//   $env:API_KEY="SUA_CHAVE_AQUI"
 const API_KEY = process.env.API_KEY || "";
 
-// Intervalo entre consultas.
+// Intervalo entre consultas
 const INTERVALO = 1000;
 
 const upload = multer({
@@ -31,6 +31,12 @@ const upload = multer({
 });
 
 app.use(express.static(path.join(__dirname, "public")));
+
+// ============================================================
+// TAREFAS EM MEMÓRIA
+// ============================================================
+
+const tarefas = new Map();
 
 // ============================================================
 // UTILITÁRIOS
@@ -70,6 +76,22 @@ function formatarSegundaColuna(valor) {
 
 function esperar(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ============================================================
+// ENVIAR EVENTO SSE
+// ============================================================
+
+function enviarEvento(tarefa, tipo, dados) {
+  tarefa.ultimoEvento = {
+    tipo,
+    dados
+  };
+
+  for (const cliente of tarefa.clientes) {
+    cliente.res.write(`event: ${tipo}\n`);
+    cliente.res.write(`data: ${JSON.stringify(dados)}\n\n`);
+  }
 }
 
 // ============================================================
@@ -142,6 +164,10 @@ async function consultarIN100(cpf, beneficio) {
   }
 }
 
+// ============================================================
+// DEFINIR STATUS
+// ============================================================
+
 function definirStatus(resultado) {
   if (resultado.blockType === "not_blocked") {
     return "DESBLOQUEADO";
@@ -163,48 +189,64 @@ function definirStatus(resultado) {
 }
 
 // ============================================================
-// PROCESSAR PLANILHA + CONSULTAR IN100
+// GERAR EXCEL
 // ============================================================
 
-app.post("/api/processar", upload.single("arquivo"), async (req, res) => {
+function gerarExcel(resultados) {
+  const worksheet = XLSX.utils.json_to_sheet(resultados);
+
+  worksheet["!cols"] = [
+    { wch: 18 },
+    { wch: 18 },
+    { wch: 28 },
+    { wch: 18 }
+  ];
+
+  const range = XLSX.utils.decode_range(worksheet["!ref"]);
+
+  // Coluna D = margem
+  // Aceita valores positivos e negativos
+  for (let linha = 1; linha <= range.e.r; linha++) {
+    const celula = worksheet[
+      XLSX.utils.encode_cell({
+        r: linha,
+        c: 3
+      })
+    ];
+
+    if (celula && typeof celula.v === "number") {
+      celula.z = 'R$ #,##0.00;[Red]-R$ #,##0.00';
+    }
+  }
+
+  const novoWorkbook = XLSX.utils.book_new();
+
+  XLSX.utils.book_append_sheet(
+    novoWorkbook,
+    worksheet,
+    "Resultado"
+  );
+
+  return XLSX.write(novoWorkbook, {
+    bookType: "xlsx",
+    type: "buffer"
+  });
+}
+
+// ============================================================
+// EXECUTAR PROCESSAMENTO
+// ============================================================
+
+async function executarTarefa(tarefa, dados) {
   try {
-    if (!req.file) {
-      return res.status(400).json({
-        erro: "Envie uma planilha."
-      });
-    }
-
-    if (!API_KEY) {
-      return res.status(500).json({
-        erro: "API_KEY não configurada. Configure a variável de ambiente API_KEY antes de iniciar o programa."
-      });
-    }
-
-    const workbook = XLSX.read(req.file.buffer, {
-      type: "buffer",
-      cellDates: false,
-      raw: true
-    });
-
-    const nomeAba = workbook.SheetNames[0];
-    const sheet = workbook.Sheets[nomeAba];
-
-    const dados = XLSX.utils.sheet_to_json(sheet, {
-      header: 1,
-      defval: "",
-      raw: true
-    });
-
-    if (!dados.length) {
-      return res.status(400).json({
-        erro: "A planilha está vazia."
-      });
-    }
-
     const resultados = [];
-    let processados = 0;
 
-    // A primeira linha é o cabeçalho original e não é consultada.
+    // --------------------------------------------------------
+    // PRIMEIRO: descobrir clientes válidos
+    // --------------------------------------------------------
+
+    const clientes = [];
+
     for (let indice = 1; indice < dados.length; indice++) {
       const linha = dados[indice] || [];
 
@@ -218,13 +260,64 @@ app.post("/api/processar", upload.single("arquivo"), async (req, res) => {
         continue;
       }
 
-      processados++;
+      clientes.push({
+        cpf,
+        beneficio,
+        cpfFormatado,
+        beneficioFormatado
+      });
+    }
+
+    const total = clientes.length;
+
+    tarefa.total = total;
+
+    if (!total) {
+      tarefa.erro =
+        "Nenhum cliente válido foi encontrado. Verifique se a planilha possui CPF na primeira coluna e benefício na segunda.";
+
+      enviarEvento(tarefa, "erro", {
+        mensagem: tarefa.erro
+      });
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // INFORMAR TOTAL
+    // --------------------------------------------------------
+
+    enviarEvento(tarefa, "inicio", {
+      total
+    });
+
+    // --------------------------------------------------------
+    // CONSULTAR CLIENTES
+    // --------------------------------------------------------
+
+    for (let indice = 0; indice < clientes.length; indice++) {
+      const cliente = clientes[indice];
+
+      const numeroAtual = indice + 1;
+
+      tarefa.processados = numeroAtual;
 
       console.log(
-        `[${processados}] Consultando CPF ${cpf} | benefício ${beneficio}`
+        `[${numeroAtual}/${total}] Consultando CPF ${cliente.cpf} | benefício ${cliente.beneficio}`
       );
 
-      const resultado = await consultarIN100(cpf, beneficio);
+      // Atualiza a interface antes da consulta
+      enviarEvento(tarefa, "progresso", {
+        atual: numeroAtual,
+        total,
+        percentual: Math.round((numeroAtual / total) * 100)
+      });
+
+      const resultado = await consultarIN100(
+        cliente.cpf,
+        cliente.beneficio
+      );
+
       const status = definirStatus(resultado);
 
       const margemValida =
@@ -232,90 +325,347 @@ app.post("/api/processar", upload.single("arquivo"), async (req, res) => {
         Number.isFinite(resultado.margem);
 
       resultados.push({
-        CPF: cpfFormatado,
-        BENEFICIO: beneficioFormatado,
+        CPF: cliente.cpfFormatado,
+        BENEFICIO: cliente.beneficioFormatado,
         "STATUS DO BENEFICIO": status,
-        MARGEM: margemValida ? resultado.margem : ""
+        MARGEM: margemValida
+          ? resultado.margem
+          : ""
       });
 
       console.log(
-        `   ${status} | margem: ${margemValida ? resultado.margem : "N/A"}`
+        `   ${status} | margem: ${
+          margemValida
+            ? resultado.margem
+            : "N/A"
+        }`
       );
 
-      if (indice < dados.length - 1) {
+      // Espera entre consultas
+      if (indice < clientes.length - 1) {
         await esperar(INTERVALO);
       }
     }
 
-    if (!resultados.length) {
-      return res.status(400).json({
-        erro: "Nenhum cliente válido foi encontrado. Verifique se a planilha possui CPF na primeira coluna e benefício na segunda."
-      });
-    }
+    // --------------------------------------------------------
+    // GERAR EXCEL
+    // --------------------------------------------------------
 
-    // ========================================================
-    // CRIAR EXCEL FINAL
-    // ========================================================
-
-    const worksheet = XLSX.utils.json_to_sheet(resultados);
-
-    worksheet["!cols"] = [
-      { wch: 18 },
-      { wch: 18 },
-      { wch: 28 },
-      { wch: 18 }
-    ];
-
-    const range = XLSX.utils.decode_range(worksheet["!ref"]);
-
-    // Coluna D = margem. Aceita positivos e negativos.
-    for (let linha = 1; linha <= range.e.r; linha++) {
-      const celula = worksheet[
-        XLSX.utils.encode_cell({ r: linha, c: 3 })
-      ];
-
-      if (celula && typeof celula.v === "number") {
-        celula.z = 'R$ #,##0.00;[Red]-R$ #,##0.00';
-      }
-    }
-
-    const novoWorkbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(novoWorkbook, worksheet, "Resultado");
-
-    const arquivoSaida = XLSX.write(novoWorkbook, {
-      bookType: "xlsx",
-      type: "buffer"
+    enviarEvento(tarefa, "finalizando", {
+      atual: total,
+      total
     });
 
-    res.setHeader(
-      "Content-Disposition",
-      'attachment; filename="resultado_in100.xlsx"'
-    );
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    const arquivoSaida = gerarExcel(resultados);
+
+    tarefa.arquivo = arquivoSaida;
+    tarefa.concluida = true;
+
+    // --------------------------------------------------------
+    // CONCLUÍDO
+    // --------------------------------------------------------
+
+    enviarEvento(tarefa, "concluido", {
+      atual: total,
+      total,
+      percentual: 100,
+      download: `/api/download/${tarefa.id}`
+    });
+
+    console.log(
+      `Tarefa ${tarefa.id} concluída: ${total} clientes.`
     );
 
-    return res.send(arquivoSaida);
   } catch (erro) {
-    console.error(erro);
+    console.error(
+      `Erro na tarefa ${tarefa.id}:`,
+      erro
+    );
 
-    return res.status(500).json({
-      erro: erro.message || "Não foi possível processar a planilha."
+    tarefa.erro =
+      erro.message ||
+      "Não foi possível processar a planilha.";
+
+    enviarEvento(tarefa, "erro", {
+      mensagem: tarefa.erro
     });
   }
+}
+
+// ============================================================
+// CRIAR PROCESSAMENTO
+// ============================================================
+
+app.post(
+  "/api/processar",
+  upload.single("arquivo"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({
+          erro: "Envie uma planilha."
+        });
+      }
+
+      if (!API_KEY) {
+        return res.status(500).json({
+          erro:
+            "API_KEY não configurada. Configure a variável de ambiente API_KEY antes de iniciar o programa."
+        });
+      }
+
+      const workbook = XLSX.read(req.file.buffer, {
+        type: "buffer",
+        cellDates: false,
+        raw: true
+      });
+
+      const nomeAba = workbook.SheetNames[0];
+
+      const sheet = workbook.Sheets[nomeAba];
+
+      const dados = XLSX.utils.sheet_to_json(
+        sheet,
+        {
+          header: 1,
+          defval: "",
+          raw: true
+        }
+      );
+
+      if (!dados.length) {
+        return res.status(400).json({
+          erro: "A planilha está vazia."
+        });
+      }
+
+      // ------------------------------------------------------
+      // CRIAR ID DA TAREFA
+      // ------------------------------------------------------
+
+      const id = crypto.randomUUID();
+
+      const tarefa = {
+        id,
+        total: 0,
+        processados: 0,
+        concluida: false,
+        erro: null,
+        arquivo: null,
+        clientes: [],
+        ultimoEvento: null,
+        criadaEm: Date.now()
+      };
+
+      tarefas.set(id, tarefa);
+
+      // ------------------------------------------------------
+      // RESPONDER IMEDIATAMENTE
+      // ------------------------------------------------------
+
+      res.json({
+        sucesso: true,
+        tarefaId: id
+      });
+
+      // ------------------------------------------------------
+      // PROCESSAR EM SEGUNDO PLANO
+      // ------------------------------------------------------
+
+      executarTarefa(tarefa, dados);
+
+    } catch (erro) {
+      console.error(erro);
+
+      return res.status(500).json({
+        erro:
+          erro.message ||
+          "Não foi possível iniciar o processamento."
+      });
+    }
+  }
+);
+
+// ============================================================
+// SSE - PROGRESSO EM TEMPO REAL
+// ============================================================
+
+app.get("/api/progresso/:id", (req, res) => {
+  const tarefa = tarefas.get(req.params.id);
+
+  if (!tarefa) {
+    return res.status(404).json({
+      erro: "Tarefa não encontrada."
+    });
+  }
+
+  res.setHeader(
+    "Content-Type",
+    "text/event-stream"
+  );
+
+  res.setHeader(
+    "Cache-Control",
+    "no-cache"
+  );
+
+  res.setHeader(
+    "Connection",
+    "keep-alive"
+  );
+
+  res.setHeader(
+    "X-Accel-Buffering",
+    "no"
+  );
+
+  res.flushHeaders();
+
+  const cliente = {
+    res
+  };
+
+  tarefa.clientes.push(cliente);
+
+  // ----------------------------------------------------------
+  // Mandar último evento para quem acabou de conectar
+  // ----------------------------------------------------------
+
+  if (tarefa.ultimoEvento) {
+    res.write(
+      `event: ${tarefa.ultimoEvento.tipo}\n`
+    );
+
+    res.write(
+      `data: ${JSON.stringify(
+        tarefa.ultimoEvento.dados
+      )}\n\n`
+    );
+  }
+
+  // ----------------------------------------------------------
+  // Se já terminou antes do SSE conectar
+  // ----------------------------------------------------------
+
+  if (tarefa.concluida) {
+    res.write(
+      `event: concluido\n`
+    );
+
+    res.write(
+      `data: ${JSON.stringify({
+        atual: tarefa.total,
+        total: tarefa.total,
+        percentual: 100,
+        download: `/api/download/${tarefa.id}`
+      })}\n\n`
+    );
+  }
+
+  if (tarefa.erro) {
+    res.write(
+      `event: erro\n`
+    );
+
+    res.write(
+      `data: ${JSON.stringify({
+        mensagem: tarefa.erro
+      })}\n\n`
+    );
+  }
+
+  // ----------------------------------------------------------
+  // Heartbeat
+  // ----------------------------------------------------------
+
+  const intervaloHeartbeat = setInterval(() => {
+    try {
+      res.write(": heartbeat\n\n");
+    } catch (_) {}
+  }, 15000);
+
+  // ----------------------------------------------------------
+  // Desconexão
+  // ----------------------------------------------------------
+
+  req.on("close", () => {
+    clearInterval(intervaloHeartbeat);
+
+    const indice = tarefa.clientes.indexOf(cliente);
+
+    if (indice !== -1) {
+      tarefa.clientes.splice(indice, 1);
+    }
+  });
 });
+
+// ============================================================
+// DOWNLOAD
+// ============================================================
+
+app.get("/api/download/:id", (req, res) => {
+  const tarefa = tarefas.get(req.params.id);
+
+  if (!tarefa) {
+    return res.status(404).json({
+      erro: "Tarefa não encontrada."
+    });
+  }
+
+  if (!tarefa.concluida || !tarefa.arquivo) {
+    return res.status(400).json({
+      erro: "O processamento ainda não terminou."
+    });
+  }
+
+  res.setHeader(
+    "Content-Disposition",
+    'attachment; filename="resultado_in100.xlsx"'
+  );
+
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  );
+
+  res.send(tarefa.arquivo);
+});
+
+// ============================================================
+// STATUS DA API
+// ============================================================
 
 app.get("/api/status", (req, res) => {
   res.json({
     online: true,
-    versao: "Beta 1 - Formatador + IN100",
+    versao: "Beta 3 - Formatador + IN100 + Progresso",
     apiConfigurada: Boolean(API_KEY)
   });
 });
 
+// ============================================================
+// LIMPEZA DE TAREFAS ANTIGAS
+// ============================================================
+
+setInterval(() => {
+  const agora = Date.now();
+
+  for (const [id, tarefa] of tarefas.entries()) {
+    // Apaga tarefas com mais de 1 hora
+    if (agora - tarefa.criadaEm > 60 * 60 * 1000) {
+      tarefas.delete(id);
+    }
+  }
+}, 10 * 60 * 1000);
+
+// ============================================================
+// INICIAR SERVIDOR
+// ============================================================
+
 app.listen(PORT, () => {
-  console.log(`Beta 1 - Formatador + IN100 rodando na porta ${PORT}`);
+  console.log(
+    `Beta 3 - Formatador + IN100 + Progresso rodando na porta ${PORT}`
+  );
 
   if (!API_KEY) {
     console.log("⚠️ API_KEY não configurada.");
@@ -323,4 +673,3 @@ app.listen(PORT, () => {
     console.log("✅ API_KEY configurada.");
   }
 });
-
