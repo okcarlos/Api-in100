@@ -1026,54 +1026,41 @@ app.get(
   }
 );
 
+/ ============================================================
+// LIMPEZA DE TAREFAS FINALIZADAS
 // ============================================================
-// LIMPEZA DE TAREFAS ANTIGAS
-// ============================================================
 
-setInterval(
-  () => {
+setInterval(() => {
+  const agora = Date.now();
 
-    const agora =
-      Date.now();
+  for (const [id, tarefa] of tarefas.entries()) {
 
-    for (
-      const [id, tarefa]
-      of tarefas.entries()
-    ) {
-
-      if (
-        agora -
-          tarefa.criadaEm >
-        TEMPO_TAREFA
-      ) {
-
-        console.log(
-          `Removendo tarefa antiga: ${id}`
-        );
-
-        // Fecha possíveis conexões SSE
-        for (
-          const cliente
-          of [...tarefa.clientes]
-        ) {
-
-          try {
-            cliente.res.end();
-          } catch (_) {}
-
-          removerCliente(
-            tarefa,
-            cliente
-          );
-        }
-
-        tarefas.delete(id);
-      }
+    // Não remove tarefas que ainda estão processando.
+    if (!tarefa.finalizadaEm) {
+      continue;
     }
 
-  },
-  10 * 60 * 10000
-);
+    // Mantém tarefas finalizadas por até 1 hora.
+    const tempoDesdeFinalizacao =
+      agora - tarefa.finalizadaEm;
+
+    if (tempoDesdeFinalizacao >= TEMPO_TAREFA) {
+      console.log(
+        `Removendo tarefa finalizada: ${id}`
+      );
+
+      for (const cliente of [...tarefa.clientes]) {
+        try {
+          cliente.res.end();
+        } catch (_) {}
+
+        removerCliente(tarefa, cliente);
+      }
+
+      tarefas.delete(id);
+    }
+  }
+}, 60 * 1000);
 
 // ============================================================
 // INICIAR SERVIDOR
