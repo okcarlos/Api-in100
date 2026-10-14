@@ -541,6 +541,9 @@ async function executarTarefa(
     tarefa.concluida =
       true;
 
+    tarefa.finalizadaEm = 
+      Date.now();
+
     tarefa.processados =
       total;
 
@@ -574,6 +577,7 @@ async function executarTarefa(
     tarefa.erro =
       erro.message ||
       "Não foi possível processar a planilha.";
+    
 
     enviarEvento(
       tarefa,
@@ -671,12 +675,16 @@ app.post(
         clientes: [],
 
         ultimoEvento: null,
+        
+        finalizadaEm: null,
 
         criadaEm:
           Date.now(),
 
         ultimaAtualizacao:
           Date.now()
+
+        
       };
 
       tarefas.set(
